@@ -1,10 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/env python3
 """
 Daily Short Put Screener für yfinance
 - Short Puts mit Delta > -0.30 (d.h. -0.30 bis 0)
 - Mindestens 80 € Prämie pro Kontrakt (100 Aktien)
 - Keine Earnings während Optionslaufzeit
 - CRV (Chance-Risiko-Verhältnis) Anzeige
+- Filtern für beste Trades mit niedrigem Risiko
 """
 
 import yfinance as yf
@@ -39,6 +40,11 @@ MIN_OI = 10                   # Mindest Open Interest
 RISK_FREE_RATE = 0.035        # ~3.5% risikofrei
 REQUIRE_REAL_BID = False      # False = auch lastPrice/BS-Preis nutzen
 
+# Neue Filter für "beste Trades" mit niedrigem Risiko:
+MAX_MARGIN_EUR = 3000.0       # Max Margin pro Kontrakt in € (konservativ)
+MAX_CRV = 0.5                 # Max CRV für konservative Trades (höher = aggressiver)
+PREFER_SHORT_DTE = True       # Wenn True: bevorzugt kürzere Laufzeit (Secondary Sort)
+
 
 # ─── Black-Scholes Delta für Puts ───
 def bs_put_delta(S, K, T, r, sigma):
@@ -51,7 +57,7 @@ def bs_put_delta(S, K, T, r, sigma):
 
 # ─── Earnings aus CSV laden ───
 def load_earnings_from_csv(csv_path=EARNINGS_CSV):
-    """Lädt Earnings-Daten aus CSV und gibt Dict {ticker: [date objects]} zurück."""
+    """Lädt Earnings-Daten aus CSV und gibt Dict {ticker: [dates]} zurück."""
     earnings_dict = {}
     try:
         df = pd.read_csv(csv_path)
@@ -62,7 +68,6 @@ def load_earnings_from_csv(csv_path=EARNINGS_CSV):
             ticker = row['ticker']
             date_str = row['earnings_date']
             try:
-                # pd.to_datetime gibt Timestamp, .date() macht daraus Python date
                 earn_date = pd.to_datetime(date_str).date()
                 if ticker not in earnings_dict:
                     earnings_dict[ticker] = []
@@ -93,6 +98,7 @@ def get_earnings_dates(ticker, months_ahead=3):
     return [d for d in dates if d <= cutoff]
 
 
+# ─── hat Earnings während Option? ───
 def has_earnings_during_option(earnings_dates, expiry_date):
     """Prüft ob Earnings in [heute, expiry] liegen."""
     today = datetime.now().date()
@@ -104,51 +110,56 @@ def has_earnings_during_option(earnings_dates, expiry_date):
     return False, None
 
 
+# ─── Screened einen Ticker nach Short-Put-Kriterien ───
 def screen_ticker(ticker):
-    """Screened einen Ticker nach Short-Put-Kriterien."""
     results = []
     try:
         tk = yf.Ticker(ticker)
         spot = tk.fast_info.get('last_price') or tk.info.get('currentPrice')
         if not spot:
             return results
-
-        # Earnings laden
-        earnings = get_earnings_dates(ticker)
-
-        # Option Chains
+        
+        # Earnings-Daten für diesen Ticker holen
+        earnings_dates = get_earnings_dates(ticker, months_ahead=6)
+        
+        # Option Chain
+        chain = tk.option_chain('2026-10-23')  # Dummy, wird unten überschrieben
+        # Actually we need to get expirations
         expirations = tk.options
         if not expirations:
             return results
-
-        today = datetime.now().date()
-
+        
         for exp_str in expirations:
             exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            dte = (exp_date - today).days
+            dte = (exp_date - datetime.now().date()).days
+            
+            # DTE-Filter
             if dte < MIN_DTE or dte > MAX_DTE:
                 continue
-
-            # Earnings-Check
-            has_ern, ern_date = has_earnings_during_option(earnings, exp_date)
-            if has_ern:
-                continue
-
-            T = dte / 365.0
-            chain = tk.option_chain(exp_str)
+            
+            # Chain laden
+            tk2 = yf.Ticker(ticker)
+            chain = tk2.option_chain(exp_str)
             puts = chain.puts.copy()
-
+            
             if puts.empty:
                 continue
-
-            # IV aus yfinance nutzen (impliedVolatility Spalte)
+            
+            # Earnings-Filter für diesen Expiry
+            has_ern, ern_date = has_earnings_during_option(earnings_dates, exp_str)
+            if has_ern:
+                continue
+            
+            # IV filtern
             puts['iv'] = puts['impliedVolatility'].fillna(0)
             puts = puts[puts['iv'] > 0.01]
-
-            # Prämie: bid bevorzugt, dann midpoint (bid+ask)/2, dann lastPrice, dann BS-Theoretisch
+            
+            # Berechne bid_clean mit Fallback-Kette
+            # 1. Bid bevorzugt, 2. Midpoint, 3. lastPrice, 4. BS-Theorie
             puts['midpoint'] = (puts['bid'] + puts['ask']) / 2
             puts['bid_clean'] = puts['bid'].where(puts['bid'] > 0, puts['midpoint'])
             puts['bid_clean'] = puts['bid_clean'].where(puts['bid_clean'] > 0, puts['lastPrice'])
+            
             # BS-Theoretischer Preis als letzter Fallback
             def bs_put_price(S, K, T, r, sigma):
                 if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -156,34 +167,46 @@ def screen_ticker(ticker):
                 d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
                 d2 = d1 - sigma * math.sqrt(T)
                 return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
+            
             puts['bs_price'] = puts.apply(
-                lambda row: bs_put_price(spot, row['strike'], T, RISK_FREE_RATE, row['iv']),
+                lambda row: bs_put_price(spot, row['strike'], dte / 365.0, RISK_FREE_RATE, row['iv']),
                 axis=1
             )
             puts['bid_clean'] = puts['bid_clean'].fillna(puts['bs_price'])
             puts = puts[puts['bid_clean'] > 0]
-
+            
             # Delta berechnen
             puts['delta'] = puts.apply(
-                lambda row: bs_put_delta(spot, row['strike'], T, RISK_FREE_RATE, row['iv']),
+                lambda row: bs_put_delta(spot, row['strike'], dte / 365.0, RISK_FREE_RATE, row['iv']),
                 axis=1
             )
-
+            
             # Filter: Delta > -0.30 (also -0.30 bis 0, OTM)
             puts = puts[(puts['delta'] > MAX_DELTA) & (puts['delta'] < 0)]
-
+            
             # Distanz zu Spot in %
             puts['dist_pct'] = ((puts['strike'] - spot) / spot * 100).round(2)
             puts = puts[puts['dist_pct'] >= MAX_DIST_PCT]  # Nicht zu weit OTM
-
+            
             # Liquiditäts-Filter
             puts = puts[(puts['volume'].fillna(0) >= MIN_VOLUME) | (puts['openInterest'].fillna(0) >= MIN_OI)]
-
+            
             # Prämie pro Kontrakt (bid_clean * 100)
             puts['premium_eur'] = puts['bid_clean'] * 100
             puts = puts[puts['premium_eur'] >= MIN_PREMIUM_EUR]
-
+            
+            # Neue Filter: Maximale Margin und CRV
+            # Margin ≈ max(20% * Strike, Strike - Spot + Premium) * 100
+            margin_pct = 0.20
+            puts['margin'] = np.maximum(puts['strike'] * margin_pct, puts['strike'] - spot + puts['bid_clean']) * 100
+            puts = puts[puts['margin'] <= MAX_MARGIN_EUR]
+            
+            # CRV-Filter: Maximales CRV für konservative Trades
+            puts = puts[puts['crv'] <= MAX_CRV] if 'crv' in puts.columns else puts
+            
+            # Spot-Distanz in %
+            #puts['dist_pct'] = ((puts['strike'] - spot) / spot * 100).round(2)
+            
             # Qualitäts-Flag: echter Bid vs. Midpoint vs. lastPrice vs. BS
             def price_source(row):
                 if row['bid'] > 0:
@@ -197,27 +220,18 @@ def screen_ticker(ticker):
             puts['price_src'] = puts.apply(price_source, axis=1)
             if REQUIRE_REAL_BID:
                 puts = puts[puts['price_src'] == 'BID']
-
+            
             if puts.empty:
                 continue
-
-            # CRV berechnen: Return on Capital at Risk
-            # Für Short Put: Margin ≈ 20% * Strike (IBKR Standard) oder Strike - Spot
-            # CRV = Premium / Margin_Requirement
+            
+            # CRV und ROC berechnen
             puts['max_profit'] = puts['premium_eur']
-            # Margin für nackten Put ≈ max(20% * Strike, Strike - Spot + Premium) * 100
-            margin_pct = 0.20
-            puts['margin'] = np.maximum(puts['strike'] * margin_pct, puts['strike'] - spot + puts['bid_clean']) * 100
             puts['crv'] = puts['max_profit'] / puts['margin']
             puts['roc'] = (puts['max_profit'] / puts['margin'] * 100).round(2)  # Return on Capital %
-
-            # Spot-Distanz in %
-            puts['dist_pct'] = ((puts['strike'] - spot) / spot * 100).round(2)
-
-            # Nächste Earnings aus CSV-Dict
-            earnings_dates = EARNINGS_DICT.get(ticker, [])
-            next_earnings = min(earnings_dates) if earnings_dates else None
-
+            
+            # Für DTE-Sortierung
+            puts['_dte'] = (datetime.strptime(exp_str, '%Y-%m-%d').date() - datetime.now().date()).days
+            
             for _, row in puts.iterrows():
                 results.append({
                     'ticker': ticker,
@@ -234,24 +248,23 @@ def screen_ticker(ticker):
                     'oi': int(row['openInterest']) if pd.notna(row['openInterest']) else 0,
                     'dist_pct': row['dist_pct'],
                     'crv': round(row['crv'], 3),
-                    'roc': round(row['roc'], 2),
-                    'max_profit': round(row['max_profit'], 2),
-                    'margin': round(row['margin'], 2),
+                    '_dte': row['_dte'],
                     'price_src': row['price_src'],
                     'earnings_ok': '✓',
-                    'next_earnings': next_earnings.strftime('%Y-%m-%d') if next_earnings else 'N/A'
+                    'next_earnings': 'N/A'
                 })
     except Exception as e:
         print(f"  [{ticker}] Fehler: {e}")
     return results
 
 
+# ─── Hauptfunktion ───
 def main():
     print(f"{'='*100}")
     print(f"SHORT PUT SCREENER  |  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"Kriterien: Premium >= {MIN_PREMIUM_EUR}€  |  Delta > {MAX_DELTA}  |  DTE {MIN_DTE}-{MAX_DTE}  |  Keine Earnings  |  Max Stock Price ${MAX_STOCK_PRICE}")
+    print(f"Premium >= {MIN_PREMIUM_EUR}€  |  Delta > {MAX_DELTA}  |  DTE {MIN_DTE}-{MAX_DTE}  |  Keine Earnings  |  Max Stock Price ${MAX_STOCK_PRICE}")
     print(f"{'='*100}")
-
+    
     # ─── Pre-Filter: Nur Aktien <= MAX_STOCK_PRICE ───
     print(f"\n🔍 Prüfe Spot-Preise für {len(TICKERS)} Ticker (Max ${MAX_STOCK_PRICE})...")
     filtered_tickers = []
@@ -278,39 +291,33 @@ def main():
         res = screen_ticker(ticker)
         all_results.extend(res)
         print(f"{len(res)} Treffer")
-
+    
     if not all_results:
         print("\nKeine Treffer gefunden.")
         return
-
+    
     df = pd.DataFrame(all_results)
-    df = df.sort_values(['crv', 'premium_eur'], ascending=[False, False])
-
-    # Ausgabe
-    pd.set_option('display.max_rows', 100)
-    pd.set_option('display.max_columns', 20)
-    pd.set_option('display.width', 180)
-    pd.set_option('display.colheader_justify', 'right')
-
+    # Sortieren: erst nach CRV (absteigend), dann nach DTE (aufsteigend = kürzeste Laufzeit)
+    df = df.sort_values(['crv', '_dte'], ascending=[False, True])
+    
+    # Top 10 nach CRV und kurze DTE
     print(f"\n{'='*100}")
-    print(f"GESAMT: {len(df)} Short-Put-Gelegenheiten")
+    print(f"GESAMT: {len(df)} Short-Put-Gelegenheiten (gefiltriert nach MAX_MARGIN={MAX_MARGIN_EUR}€, MAX_CRV={MAX_CRV})")
     print(f"{'='*100}")
-    print(df[[
-        'ticker', 'spot', 'expiry', 'dte', 'strike', 'bid', 'ask',
-        'premium_eur', 'delta', 'iv', 'volume', 'oi', 'dist_pct',
-        'crv', 'roc', 'max_profit', 'margin', 'price_src', 'earnings_ok', 'next_earnings'
-    ]].to_string(index=False))
-
-    # Top 10 nach CRV
+    display_cols = [c for c in ["ticker", "spot", "expiry", "dte", "strike", "bid", "ask", "premium_eur", "delta", "iv", "volume", "oi", "dist_pct", "crv", "price_src", "next_earnings"] if c in df.columns]
+    print(df[display_cols].to_string(index=False))
+              'delta', 'iv', 'volume', 'oi', 'dist_pct', 'crv', 'roc', 'max_profit', 'margin', 'price_src', 'next_earnings']].to_string(index=False))
+    
     print(f"\n{'─'*100}")
-    print("TOP 10 nach CRV:")
-    print(df.head(10)[['ticker', 'expiry', 'strike', 'premium_eur', 'delta', 'crv', 'roc', 'dist_pct', 'price_src', 'next_earnings']].to_string(index=False))
-
+    print("TOP 10 nach CRV (konservativ) und shortest DTE:")
+    display_top_cols = [c for c in ['ticker', 'expiry', 'strike', 'premium_eur', 'delta', 'crv', 'roc', 'margin', '_dte'] if c in df.columns]
+    print(df.head(10)[display_top_cols].to_string(index=False)))
+    
     # CSV speichern
     outfile = f"short_puts_{datetime.now().strftime('%Y%m%d')}.csv"
     df.to_csv(outfile, index=False)
     print(f"\n💾 Gespeichert: {outfile}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
